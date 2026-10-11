@@ -31,7 +31,8 @@ pip install -r requirements.txt
 ### Run
 
 ```sh
-python forrest_type.py LAT LON [--radius 1000] [--raw] [--no-wiki] [--endpoint URL]
+python forrest_type.py LAT LON [--radius 1000] [--raw] [--no-wiki]
+                      [--no-gbif] [--endpoint URL]
 ```
 
 Examples:
@@ -54,7 +55,12 @@ The script queries the Overpass API for forest areas (`natural=wood`,
 - the most common `species` / `genus` / `taxon` values (split on `;`),
 - short Wikipedia descriptions of the top species (from the
   [Wikipedia REST API](https://en.wikipedia.org/api/rest_v1/)),
-  since OSM tags carry no appearance data.
+  since OSM tags carry no appearance data,
+- species *actually observed* within the radius, from the
+  [GBIF occurrence API](https://www.gbif.org/developer/summary) — an
+  independent second source that works even where nobody has mapped
+  trees in OSM. All plants are listed (GBIF has no tree-only filter),
+  so herbs and mosses can appear alongside trees.
 
 `--raw` dumps the raw Overpass JSON — this is the main purpose of the PoC:
 studying what data actually exists around a point.
@@ -73,5 +79,10 @@ studying what data actually exists around a point.
   forest usually matches; a point near but outside it may not.
 - **Wikipedia titles may not match** the scientific names in OSM tags; failed
   lookups are non-fatal and simply skipped.
+- **GBIF records are observations, not forest composition.** The counts
+  reflect where people recorded plants (iNaturalist, herbaria, field
+  surveys) and are biased toward well-surveyed, often urban areas. The
+  lookup is best-effort: a failed call prints a warning and the report
+  continues without the section.
 - The forest-type label is a rough estimate from the dominant tags, not a
   proper classification of the vegetation.

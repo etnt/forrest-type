@@ -6,11 +6,13 @@ forest/woodland areas (natural=wood, landuse=forest) and mapped trees
 (natural=tree, natural=tree_row). Summarises the forest types (leaf_type /
 leaf_cycle), the tree species and genera found in the OSM tags, and - where
 possible - adds a short description of each species from the Wikipedia REST
-API (OSM carries no appearance data of its own).
+API (OSM carries no appearance data of its own). As a second, independent
+species source it lists species actually observed near the point, from the
+GBIF occurrence API (Phase 1 of plan/forest-data-sources-plan.md).
 
 Usage:
     python forrest_type.py LAT LON [--radius 1000] [--raw]
-                           [--no-wiki] [--endpoint URL]
+                           [--no-wiki] [--no-gbif] [--endpoint URL]
 
 Examples:
     python forrest_type.py 59.3293 18.0686 --radius 2000   # Stockholm
@@ -18,13 +20,15 @@ Examples:
     python forrest_type.py 0 0 --raw                       # ocean, raw dump
 
 Requires: requests (see requirements.txt). Pure functions (build_query,
-summarize) make no network calls and are unit tested in tests/test_summarize.py.
+summarize, build_gbif_geometry, gbif_facets_to_counts, resolve_gbif_names)
+make no network calls and are unit tested in tests/.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections import Counter
@@ -34,6 +38,9 @@ import requests
 DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter"
 MIRROR_ENDPOINT = "https://overpass.kumi.systems/api/interpreter"
 WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+GBIF_API = "https://api.gbif.org/v1/occurrence/search"
+GBIF_SPECIES_URL = "https://api.gbif.org/v1/species/{key}"
+PLANTAE_KINGDOM_KEY = 6
 MAX_RADIUS = 5000  # metres; keep the public Overpass server happy
 DEFAULT_RADIUS = 1000
 
@@ -283,11 +290,150 @@ def describe_species(name: str, session: requests.Session, cache: dict) -> str |
 
 
 # --------------------------------------------------------------------------
+# GBIF species observations (second, independent data source)
+# --------------------------------------------------------------------------
+
+def build_gbif_geometry(lat: float, lon: float, radius_m: int,
+                        vertices: int = 24) -> str:
+    """Return a WKT polygon approximating a circle of ``radius_m`` metres.
+
+    GBIF's occurrence search accepts a ``geometry`` WKT filter but has no
+    circle primitive, so we emit a regular 24-vertex polygon. Every vertex
+    sits at distance ~radius from the centre (great-circle approximated
+    with flat local scaling), matching the Overpass `around:` semantics
+    closely enough for a PoC.
+    """
+    rlat = radius_m / 111_320.0
+    rlon = radius_m / (111_320.0 * max(math.cos(math.radians(lat)), 1e-9))
+    points = [
+        f"{lon + rlon * math.cos(a):.6f} {lat + rlat * math.sin(a):.6f}"
+        for a in (2 * math.pi * k / vertices for k in range(vertices))
+    ]
+    # A valid WKT polygon repeats the first point at the end.
+    return "POLYGON((" + ",".join(points + [points[0]]) + "))"
+
+
+def gbif_facets_to_counts(body: dict) -> Counter[int]:
+    """Extract the speciesKey facet counts from a GBIF search response.
+
+    Returns a Counter mapping taxon key -> occurrence count, or an empty
+    Counter when the response carries no facets. Pure function.
+    """
+    counts: Counter = Counter()
+    facets = body.get("facets") or []
+    for facet in facets:
+        # GBIF calls the field 'SPECIES_KEY' in live responses; normalise
+        # by dropping underscores so both spellings match.
+        field = (facet.get("field") or "").upper().replace("_", "")
+        if field != "SPECIESKEY":
+            continue
+        for entry in facet.get("counts") or []:
+            try:
+                counts[int(entry["name"])] = int(entry["count"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return counts
+
+
+def gbif_name_for_key(key: int, session: requests.Session,
+                      cache: dict) -> str | None:
+    """Resolve a GBIF taxon key to a display name (best-effort, cached).
+
+    Prefers the binomial ('Quercus robur') over the full scientific name
+    with author ('Quercus robur L.'), and appends the English vernacular
+    name when GBIF knows one: 'Quercus robur (Pedunculate Oak)'.
+    Returns None on any failure or if the key resolves above species rank.
+    """
+    if key in cache:
+        return cache[key]
+
+    name = None
+    try:
+        resp = session.get(GBIF_SPECIES_URL.format(key=key), timeout=10)
+        if resp.status_code == 200:
+            body = resp.json()
+            if isinstance(body, dict):
+                binomial = body.get("species") or body.get("scientificName")
+                if body.get("rank") in ("SPECIES", "SUBSPECIES", "VARIETY") and binomial:
+                    vernacular = body.get("vernacularName")
+                    name = f"{binomial} ({vernacular})" if vernacular else binomial
+    except (requests.RequestException, ValueError):
+        name = None
+
+    cache[key] = name
+    return name
+
+
+def resolve_gbif_names(counts: Counter[int], lookup, top: int) -> dict[str, int]:
+    """Turn taxon-key counts into a name -> count dict via ``lookup``.
+
+    Walks the counts in descending order and keeps the first ``top`` keys
+    that resolve to a name. Unresolvable keys (None) are skipped. Pure
+    function; ``lookup`` is injected so tests can run without network.
+    """
+    names: dict[str, int] = {}
+    for key, count in counts.most_common():
+        if len(names) >= top:
+            break
+        name = lookup(key)
+        if name and name not in names:
+            names[name] = count
+    return names
+
+
+def fetch_gbif_species(lat: float, lon: float, radius: int, top: int = 10,
+                       session: requests.Session | None = None,
+                       ) -> tuple[int, dict[str, int]] | None:
+    """Query GBIF for observed plant species within the radius.
+
+    Returns (total occurrences in radius, {display name: count}) for the
+    top observed species, or None on any failure. Best-effort: callers
+    treat None as 'GBIF unavailable' and never block the report on it.
+    """
+    session = session or requests.Session()
+    try:
+        resp = session.get(
+            GBIF_API,
+            params={
+                "geometry": build_gbif_geometry(lat, lon, radius),
+                "kingdom_key": PLANTAE_KINGDOM_KEY,
+                "facet": "speciesKey",
+                "facetLimit": top * 3,  # headroom for unresolvable keys
+                "limit": 0,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"warning: GBIF returned HTTP {resp.status_code} - "
+                  f"skipping observed-species section", file=sys.stderr)
+            return None
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"warning: GBIF request failed: {exc} - skipping "
+              f"observed-species section", file=sys.stderr)
+        return None
+
+    if not isinstance(body, dict):
+        print("warning: GBIF returned unexpected JSON - skipping "
+              "observed-species section", file=sys.stderr)
+        return None
+
+    counts = gbif_facets_to_counts(body)
+    cache: dict = {}
+    species = resolve_gbif_names(
+        counts,
+        lambda key: gbif_name_for_key(key, session, cache),
+        top,
+    )
+    return body.get("count", 0), species
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
 def print_report(lat: float, lon: float, radius: int, summary: dict,
-                 with_wiki: bool = True) -> None:
+                 with_wiki: bool = True, with_gbif: bool = True) -> None:
     """Print a plain-text report of the summarised data."""
     print(f"Location: {lat}, {lon}  (radius {radius} m)")
     print()
@@ -369,6 +515,22 @@ def print_report(lat: float, lon: float, radius: int, summary: dict,
         print("  often only carries leaf_type/leaf_cycle, if anything.")
         print()
 
+    if with_gbif:
+        gbif = fetch_gbif_species(lat, lon, radius)
+        if gbif is not None:
+            total, species_counts = gbif
+            print("Species observed nearby (GBIF)")
+            print(f"  ({total} plant occurrences recorded within the radius)")
+            print("  (all plants - herbs, mosses etc. included; GBIF has no "
+                  "tree-only filter)")
+            if species_counts:
+                for name, count in species_counts.items():
+                    print(f"  {name}: {count}")
+            else:
+                print("  (no species observations recorded in GBIF for "
+                      "this area)")
+            print()
+
     if (summary["forest_area_count"] == 0 and summary["tree_count"] == 0
             and summary["tree_row_count"] == 0):
         print("Nothing found at this location.")
@@ -386,7 +548,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="forrest_type.py",
         description="Describe forest types and tree species around a lat/lon "
-        "using OpenStreetMap (Overpass) plus Wikipedia summaries.",
+        "using OpenStreetMap (Overpass) plus Wikipedia summaries and GBIF "
+        "species observations.",
     )
     parser.add_argument("lat", type=float, help="latitude, -90..90")
     parser.add_argument("lon", type=float, help="longitude, -180..180")
@@ -396,6 +559,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="dump the raw Overpass JSON (for studying the data)")
     parser.add_argument("--no-wiki", action="store_true",
                         help="skip the Wikipedia lookups")
+    parser.add_argument("--no-gbif", action="store_true",
+                        help="skip the GBIF observed-species lookup")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
                         help="Overpass API endpoint URL")
     return parser.parse_args(argv)
@@ -433,7 +598,8 @@ def main(argv: list[str] | None = None) -> None:
     sys.stdout = report_out
     try:
         print_report(args.lat, args.lon, radius, summary,
-                     with_wiki=not args.no_wiki)
+                     with_wiki=not args.no_wiki,
+                     with_gbif=not args.no_gbif)
     finally:
         sys.stdout = old_stdout
 
