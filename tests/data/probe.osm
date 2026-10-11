@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="probe-fixture">
+ <!-- tree inside the 500 m radius of the test point 59.3293,18.0686 -->
+ <node id="1" lat="59.3295" lon="18.0690" version="1"><tag k="natural" v="tree"/></node>
+ <!-- tree far outside -->
+ <node id="2" lat="59.0200" lon="18.0000" version="1"><tag k="natural" v="tree"/></node>
+ <!-- untagged ring geometry, member of the multipolygon relation below -->
+ <node id="3" lat="59.3296" lon="18.0691" version="1"/>
+ <node id="4" lat="59.3297" lon="18.0692" version="1"/>
+ <node id="5" lat="59.3296" lon="18.0693" version="1"/>
+ <!-- nodes for the open tree_row lines -->
+ <node id="6" lat="59.3290" lon="18.0680" version="1"/>
+ <node id="7" lat="59.3291" lon="18.0681" version="1"/>
+ <node id="8" lat="59.0205" lon="18.0005" version="1"/>
+ <node id="9" lat="59.0206" lon="18.0006" version="1"/>
+ <!-- big forest square around the test point: all vertices are more
+      than 500 m away, so it is only caught by the point-in-ring test -->
+ <node id="10" lat="59.3200" lon="18.0500" version="1"/>
+ <node id="11" lat="59.3200" lon="18.0900" version="1"/>
+ <node id="12" lat="59.3400" lon="18.0900" version="1"/>
+ <node id="13" lat="59.3400" lon="18.0500" version="1"/>
+ <!-- nodes for the far landuse=forest square -->
+ <node id="14" lat="59.0000" lon="18.0000" version="1"/>
+ <node id="15" lat="59.0000" lon="18.0100" version="1"/>
+ <node id="16" lat="59.0100" lon="18.0100" version="1"/>
+ <node id="17" lat="59.0100" lon="18.0000" version="1"/>
+ <way id="10" version="1"><nd ref="3"/><nd ref="4"/><nd ref="5"/><nd ref="3"/></way>
+ <way id="11" version="1"><nd ref="6"/><nd ref="7"/><tag k="natural" v="tree_row"/></way>
+ <way id="12" version="1"><nd ref="8"/><nd ref="9"/><tag k="natural" v="tree_row"/></way>
+ <way id="30" version="1"><nd ref="10"/><nd ref="11"/><nd ref="12"/><nd ref="13"/><nd ref="10"/><tag k="natural" v="wood"/><tag k="name" v="Big Probe Wood"/></way>
+ <way id="31" version="1"><nd ref="14"/><nd ref="15"/><nd ref="16"/><nd ref="17"/><nd ref="14"/><tag k="landuse" v="forest"/></way>
+ <relation id="20" version="1"><member type="way" ref="10" role="outer"/><tag k="type" v="multipolygon"/><tag k="natural" v="wood"/><tag k="leaf_type" v="broadleaved"/><tag k="name" v="Probe Relation Wood"/></relation>
+ <relation id="21" version="1"><member type="way" ref="31" role="outer"/><tag k="type" v="multipolygon"/><tag k="landuse" v="forest"/></relation>
+</osm>

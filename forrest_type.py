@@ -13,15 +13,19 @@ GBIF occurrence API (Phase 1 of plan/forest-data-sources-plan.md).
 Usage:
     python forrest_type.py LAT LON [--radius 1000] [--raw]
                            [--no-wiki] [--no-gbif] [--endpoint URL]
+                           [--osm-pbf FILE]
 
 Examples:
     python forrest_type.py 59.3293 18.0686 --radius 2000   # Stockholm
     python forrest_type.py 57.0 14.5                       # rural Sweden
     python forrest_type.py 0 0 --raw                       # ocean, raw dump
+    python forrest_type.py 59.3293 18.0686 --osm-pbf data/sweden-latest.osm.pbf
 
-Requires: requests (see requirements.txt). Pure functions (build_query,
-summarize, build_gbif_geometry, gbif_facets_to_counts, resolve_gbif_names)
-make no network calls and are unit tested in tests/.
+Requires: requests (see requirements.txt). osmium (pyosmium) is only
+needed for --osm-pbf. Pure functions (build_query, summarize,
+build_gbif_geometry, gbif_facets_to_counts, resolve_gbif_names,
+distance_m, point_in_ring) make no network calls and are unit tested
+in tests/.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections import Counter
@@ -290,6 +295,133 @@ def describe_species(name: str, session: requests.Session, cache: dict) -> str |
 
 
 # --------------------------------------------------------------------------
+# Local OSM extract (Phase 2: same data as Overpass, no network)
+# --------------------------------------------------------------------------
+
+def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two points (haversine)."""
+    r = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def point_in_ring(lat: float, lon: float, ring: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon test.
+
+    ``ring`` is a list of (lat, lon) tuples describing a closed polygon
+    boundary (no explicit repeat of the first vertex is required). Pure
+    function; used to detect 'small circle fully inside a large forest'.
+    """
+    inside = False
+    n = len(ring)
+    for i in range(n):
+        lat1, lon1 = ring[i]
+        lat2, lon2 = ring[(i + 1) % n]
+        if (lon1 > lon) != (lon2 > lon):
+            lat_cross = lat1 + (lon - lon1) * (lat2 - lat1) / (lon2 - lon1)
+            if lat > lat_cross:
+                inside = not inside
+    return inside
+
+
+def _area_outer_rings(area) -> list[list[tuple[float, float]]]:
+    """Collect the outer rings of a pyosmium Area as (lat, lon) point lists."""
+    rings: list[list[tuple[float, float]]] = []
+    for ring in area.outer_rings():
+        rings.append([(location.lat, location.lon) for location in ring])
+    return rings
+
+
+def _way_node_points(way) -> list[tuple[float, float]]:
+    """Collect valid (lat, lon) points of a pyosmium Way's nodes."""
+    return [(n.location.lat, n.location.lon)
+            for n in way.nodes if n.location.valid()]
+
+
+def read_osm_extract(path: str, lat: float, lon: float, radius: int) -> list[dict]:
+    """Read a local OSM extract (.osm.pbf or .osm XML) and return the
+    forest/tree elements near (lat, lon), in the loose element schema that
+    summarize() consumes ({type, id, tags}).
+
+    Mirrors the Overpass 'around:' semantics as closely as a PoC needs:
+    - nodes (natural=tree): included when the node itself is within radius;
+    - areas (closed ways and multipolygon relations: natural=wood,
+      landuse=forest, natural=tree_row): included when any outer-ring
+      vertex is within radius OR the point falls inside the polygon;
+    - open ways (natural=tree_row lines): included when any node is
+      within radius.
+
+    Requires pyosmium (osmium), imported lazily so the Overpass path
+    works without it. Raises SystemExit with a readable message when the
+    file cannot be read.
+    """
+    try:
+        import osmium
+    except ImportError:
+        print("error: --osm-pbf needs the 'osmium' package: pip install osmium",
+              file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(path):
+        print(f"error: OSM extract not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    elements: list[dict] = []
+    try:
+        processor = (osmium.FileProcessor(path)
+                     .with_locations()
+                     .with_areas()
+                     .with_filter(osmium.filter.KeyFilter("natural", "landuse")))
+        for obj in processor:
+            kind = type(obj).__name__
+            tags = dict(obj.tags)
+            natural = tags.get("natural")
+            landuse = tags.get("landuse")
+            is_forest = natural == "wood" or landuse == "forest"
+
+            if kind == "Node":
+                if natural == "tree" and obj.location.valid():
+                    if distance_m(lat, lon, obj.location.lat, obj.location.lon) <= radius:
+                        elements.append({"type": "node", "id": obj.id, "tags": tags})
+
+            elif kind == "Area":
+                if not (is_forest or natural == "tree_row"):
+                    continue
+                rings = _area_outer_rings(obj)
+                points = [p for ring in rings for p in ring]
+                near = any(distance_m(lat, lon, plat, plon) <= radius
+                           for plat, plon in points)
+                # 'small circle inside a big forest': no vertex is close,
+                # but the point itself lies within the polygon
+                inside = (not near and
+                          any(point_in_ring(lat, lon, ring) for ring in rings))
+                if near or inside:
+                    elements.append({"type": "way" if obj.from_way() else "relation",
+                                     "id": obj.orig_id(), "tags": tags})
+
+            elif kind == "Way":
+                # open tree_row lines; closed ways are handled as Areas,
+                # so skip closed ways here to avoid double counting
+                node_refs = [n.ref for n in obj.nodes]
+                closed = len(node_refs) > 1 and node_refs[0] == node_refs[-1]
+                if natural != "tree_row" or closed:
+                    continue
+                points = _way_node_points(obj)
+                if any(distance_m(lat, lon, plat, plon) <= radius for plat, plon in points):
+                    elements.append({"type": "way", "id": obj.id, "tags": tags})
+
+            # Relation objects are skipped: forest relations come through
+            # as Areas via with_areas().
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"error: could not read OSM extract {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    return elements
+
+
+# --------------------------------------------------------------------------
 # GBIF species observations (second, independent data source)
 # --------------------------------------------------------------------------
 
@@ -433,9 +565,12 @@ def fetch_gbif_species(lat: float, lon: float, radius: int, top: int = 10,
 # --------------------------------------------------------------------------
 
 def print_report(lat: float, lon: float, radius: int, summary: dict,
-                 with_wiki: bool = True, with_gbif: bool = True) -> None:
+                 with_wiki: bool = True, with_gbif: bool = True,
+                 source: str | None = None) -> None:
     """Print a plain-text report of the summarised data."""
     print(f"Location: {lat}, {lon}  (radius {radius} m)")
+    if source:
+        print(f"Data source: {source}")
     print()
 
     print("Counts")
@@ -563,6 +698,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="skip the GBIF observed-species lookup")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
                         help="Overpass API endpoint URL")
+    parser.add_argument("--osm-pbf", metavar="FILE", default=None,
+                        help="read a local OSM extract (.osm.pbf or .osm XML) "
+                        "instead of querying the Overpass API")
     return parser.parse_args(argv)
 
 
@@ -580,14 +718,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.radius > MAX_RADIUS:
         print(f"warning: radius capped at {MAX_RADIUS} m", file=sys.stderr)
 
-    query = build_query(args.lat, args.lon, radius)
-    data = fetch(query, args.endpoint)
+    if args.osm_pbf:
+        elements = read_osm_extract(args.osm_pbf, args.lat, args.lon, radius)
+        if args.raw:
+            print(json.dumps({"elements": elements}, indent=2, ensure_ascii=False))
+        summary = summarize(elements)
+        source = f"local OSM extract ({args.osm_pbf})"
+    else:
+        query = build_query(args.lat, args.lon, radius)
+        data = fetch(query, args.endpoint)
+        if args.raw:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+        elements = data.get("elements", [])
+        summary = summarize(elements)
+        source = f"Overpass API ({args.endpoint})"
 
-    if args.raw:
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-
-    elements = data.get("elements", [])
-    summary = summarize(elements)
     if args.raw:
         # Keep stdout a pure JSON dump; the readable report goes to stderr.
         report_out = sys.stderr
@@ -599,7 +744,8 @@ def main(argv: list[str] | None = None) -> None:
     try:
         print_report(args.lat, args.lon, radius, summary,
                      with_wiki=not args.no_wiki,
-                     with_gbif=not args.no_gbif)
+                     with_gbif=not args.no_gbif,
+                     source=source)
     finally:
         sys.stdout = old_stdout
 

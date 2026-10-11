@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ```sh
 python forrest_type.py LAT LON [--radius 1000] [--raw] [--no-wiki]
-                      [--no-gbif] [--endpoint URL]
+                      [--no-gbif] [--endpoint URL] [--osm-pbf FILE]
 ```
 
 Examples:
@@ -65,6 +65,31 @@ The script queries the Overpass API for forest areas (`natural=wood`,
 `--raw` dumps the raw Overpass JSON — this is the main purpose of the PoC:
 studying what data actually exists around a point.
 
+### Offline mode (`--osm-pbf`)
+
+Instead of querying the Overpass API, the same OSM data can be read from a
+local extract — deterministic, no 504s, repeatable:
+
+```sh
+mkdir -p data
+curl -L -o data/sweden-latest.osm.pbf \
+    https://download.geofabrik.de/europe/sweden-latest.osm.pbf
+python forrest_type.py 59.3293 18.0686 --radius 2000 \
+    --osm-pbf data/sweden-latest.osm.pbf
+```
+
+Extracts for any region are available from
+[Geofabrik](https://download.geofabrik.de/). This needs the `osmium`
+(pyosmium) package, which is in `requirements.txt`. `--raw` then dumps the
+collected elements as JSON instead. Notes:
+
+- forests come from closed ways and multipolygon relations (assembled into
+  areas by pyosmium), tree rows from open ways, trees from nodes;
+- the `around:` semantics are approximated: an element is included when any
+  of its vertices is within the radius, or when the point falls inside a
+  forest polygon;
+- extracts can lag behind the live OSM database (typically hours to days).
+
 ## Data-source caveats and limitations
 
 - **OSM species tagging is sparse.** Many forest areas only carry
@@ -76,7 +101,9 @@ studying what data actually exists around a point.
   [kumi.systems mirror](https://overpass.kumi.systems/). The radius is capped
   at 5000 m for this reason.
 - **`around` matches elements touching the radius**, so a point inside a large
-  forest usually matches; a point near but outside it may not.
+  forest usually matches; a point near but outside it may not. In
+  `--osm-pbf` mode the same approximation is implemented locally (any
+  vertex within the radius, or the point inside a forest polygon).
 - **Wikipedia titles may not match** the scientific names in OSM tags; failed
   lookups are non-fatal and simply skipped.
 - **GBIF records are observations, not forest composition.** The counts
