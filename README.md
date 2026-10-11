@@ -33,6 +33,7 @@ pip install -r requirements.txt
 ```sh
 python forrest_type.py LAT LON [--radius 1000] [--raw] [--no-wiki]
                       [--no-gbif] [--endpoint URL] [--osm-pbf FILE]
+                      [--corine FILE]
 ```
 
 Examples:
@@ -90,6 +91,27 @@ collected elements as JSON instead. Notes:
   forest polygon;
 - extracts can lag behind the live OSM database (typically hours to days).
 
+### CORINE land cover (`--corine`)
+
+For an *authoritative* forest-type estimate that never depends on OSM tag
+coverage, sample a CORINE Land Cover raster (100 m classes: 311 broad-leaved,
+312 coniferous, 313 mixed, 324 transitional woodland) around the point:
+
+```sh
+python forrest_type.py 59.3293 18.0686 --corine data/clc2018_europe.tif
+```
+
+The CORINE raster is free but requires a (free) account on the Copernicus
+Land Monitoring Service: <https://land.copernicus.eu/pan-european/corine-land-cover/clc2018>.
+Place the GeoTIFF in `data/` (gitignored). Any class-coded GeoTIFF works;
+pixel centres are reprojected to WGS84 and measured with the haversine
+formula, so both the native EPSG:3035 rasters and Web Mercator exports are
+sampled correctly. Needs `rasterio` and `pyproj` (in `requirements.txt`).
+
+The report shows the class mix inside the radius and the dominant forest
+class — a useful cross-check against the OSM-tag estimate: the two sources
+are independent and usually agree for well-mapped areas.
+
 ## Data-source caveats and limitations
 
 - **OSM species tagging is sparse.** Many forest areas only carry
@@ -112,4 +134,7 @@ collected elements as JSON instead. Notes:
   lookup is best-effort: a failed call prints a warning and the report
   continues without the section.
 - The forest-type label is a rough estimate from the dominant tags, not a
-  proper classification of the vegetation.
+  proper classification of the vegetation. The `--corine` section is the
+  independent counterpart: it classifies actual land cover, but at 100 m
+  resolution and with its own generalisation errors (e.g. urban parks can
+  come out as forest, clear-cuts as transitional woodland).

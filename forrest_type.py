@@ -13,19 +13,20 @@ GBIF occurrence API (Phase 1 of plan/forest-data-sources-plan.md).
 Usage:
     python forrest_type.py LAT LON [--radius 1000] [--raw]
                            [--no-wiki] [--no-gbif] [--endpoint URL]
-                           [--osm-pbf FILE]
+                           [--osm-pbf FILE] [--corine FILE]
 
 Examples:
     python forrest_type.py 59.3293 18.0686 --radius 2000   # Stockholm
     python forrest_type.py 57.0 14.5                       # rural Sweden
     python forrest_type.py 0 0 --raw                       # ocean, raw dump
     python forrest_type.py 59.3293 18.0686 --osm-pbf data/sweden-latest.osm.pbf
+    python forrest_type.py 59.3293 18.0686 --corine data/clc2018.tif
 
 Requires: requests (see requirements.txt). osmium (pyosmium) is only
-needed for --osm-pbf. Pure functions (build_query, summarize,
-build_gbif_geometry, gbif_facets_to_counts, resolve_gbif_names,
-distance_m, point_in_ring) make no network calls and are unit tested
-in tests/.
+needed for --osm-pbf and rasterio+pyproj only for --corine. Pure
+functions (build_query, summarize, build_gbif_geometry,
+gbif_facets_to_counts, resolve_gbif_names, distance_m, point_in_ring,
+forest_estimate) make no network calls and are unit tested in tests/.
 """
 
 from __future__ import annotations
@@ -422,6 +423,141 @@ def read_osm_extract(path: str, lat: float, lon: float, radius: int) -> list[dic
 
 
 # --------------------------------------------------------------------------
+# CORINE land cover raster (Phase 3: authoritative forest type, offline)
+# --------------------------------------------------------------------------
+
+# CORINE Land Cover (CLC 2018) class codes -> readable names.
+CORINE_CLASS_NAMES = {
+    111: "Continuous urban fabric", 112: "Discontinuous urban fabric",
+    121: "Industrial or commercial units", 122: "Road and rail networks",
+    123: "Port areas", 124: "Airports",
+    131: "Mineral extraction sites", 132: "Dump sites",
+    133: "Construction sites", 141: "Green urban areas",
+    142: "Sport and leisure facilities",
+    211: "Non-irrigated arable land", 212: "Permanently irrigated land",
+    213: "Rice fields", 221: "Vineyards",
+    222: "Fruit trees and berry plantations", 223: "Olive groves",
+    231: "Pastures", 241: "Annual crops with permanent crops",
+    242: "Complex cultivation patterns",
+    243: "Agriculture with natural vegetation", 244: "Agro-forestry areas",
+    311: "Broad-leaved forest", 312: "Coniferous forest",
+    313: "Mixed forest", 321: "Natural grassland",
+    322: "Moors and heathland", 323: "Sclerophyllous vegetation",
+    324: "Transitional woodland-shrub", 331: "Beaches, dunes, sands",
+    332: "Bare rocks", 333: "Sparsely vegetated areas",
+    334: "Burnt areas", 335: "Glaciers and perpetual snow",
+    411: "Inland marshes", 412: "Peatbogs", 421: "Salt marshes",
+    422: "Salines", 423: "Intertidal flats",
+    511: "Water courses", 512: "Water bodies", 521: "Coastal lagoons",
+    522: "Estuaries", 523: "Sea and ocean",
+}
+
+# Classes that describe actual forest / woodland vegetation.
+CORINE_FOREST_CODES = frozenset({311, 312, 313, 324})
+
+
+def corine_class_name(code: int) -> str:
+    """Readable name for a CORINE class code."""
+    return CORINE_CLASS_NAMES.get(code, f"CORINE class {code}")
+
+
+def forest_estimate(counts: Counter[int]) -> str | None:
+    """Dominant CORINE forest class name from a class -> pixel count map.
+
+    Only genuine forest/woodland codes count (311/312/313/324). Returns
+    None when no forest class is present. Pure function.
+    """
+    forest = {code: n for code, n in counts.items() if code in CORINE_FOREST_CODES}
+    if not forest:
+        return None
+    top_code = max(forest.items(), key=lambda kv: kv[1])[0]
+    return corine_class_name(top_code)
+
+
+def sample_raster(path: str, lat: float, lon: float, radius: int) -> dict:
+    """Sample a categorical GeoTIFF (e.g. CORINE land cover) within radius.
+
+    Counts the class codes of all pixel centres whose ground distance to
+    (lat, lon) is <= radius. Works with any projected CRS with metre
+    units (CORINE is EPSG:3035): pixel centres are reprojected to WGS84
+    and measured with the haversine formula, so Web Mercator rasters are
+    measured correctly too.
+
+    Returns {total, nodata, counts (Counter), crs, resolution}. Raises
+    SystemExit with a readable message on failure. Needs rasterio and
+    pyproj (lazy import).
+    """
+    try:
+        import numpy as np
+        import rasterio
+        from rasterio.windows import Window
+        from pyproj import Transformer
+    except ImportError as exc:
+        print(f"error: --corine needs 'rasterio' and 'pyproj': pip install "
+              f"rasterio pyproj ({exc})", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(path):
+        print(f"error: CORINE raster not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with rasterio.open(path) as ds:
+            if ds.crs is None:
+                print(f"error: {path} has no CRS; a georeferenced raster is "
+                      f"required", file=sys.stderr)
+                sys.exit(1)
+            to_crs = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            px, py = to_crs.transform(lon, lat)
+            row, col = rasterio.transform.rowcol(ds.transform, px, py)
+            resx, resy = ds.res
+            # pad generously: Web Mercator inflates distances by up to
+            # ~2x at northern latitudes, so 2.5x covers it
+            pad_c = int(radius / max(abs(resx), 1e-9) * 2.5) + 1
+            pad_r = int(radius / max(abs(resy), 1e-9) * 2.5) + 1
+            c0 = max(int(col) - pad_c, 0)
+            r0 = max(int(row) - pad_r, 0)
+            w = min(2 * pad_c + 1, ds.width - c0)
+            h = min(2 * pad_r + 1, ds.height - r0)
+            result = {"total": 0, "nodata": 0, "counts": Counter(),
+                      "crs": str(ds.crs), "resolution": (abs(resx), abs(resy))}
+            if w <= 0 or h <= 0:
+                # point outside the raster coverage
+                return result
+            window = Window(c0, r0, w, h)
+            data = ds.read(1, window=window)
+            wtr = ds.window_transform(window)
+            rows_i, cols_i = np.indices(data.shape)
+            xs, ys = rasterio.transform.xy(wtr, rows_i, cols_i)
+            to_wgs = Transformer.from_crs(ds.crs, "EPSG:4326", always_xy=True)
+            lons, lats = to_wgs.transform(xs, ys)
+            lons = np.asarray(lons)
+            lats = np.asarray(lats)
+            # vectorised haversine
+            p1 = math.radians(lat)
+            p2 = np.radians(lats)
+            a = (np.sin((p2 - p1) / 2) ** 2
+                 + math.cos(p1) * np.cos(p2) * np.sin(np.radians(lons - lon) / 2) ** 2)
+            dist = 2 * 6_371_000.0 * np.arcsin(np.sqrt(a))
+            within = dist <= radius
+            nodata = ds.nodata
+            counts = result["counts"]
+            nodata_count = 0
+            for value, is_within in zip(data.flat, within.flat):
+                if not is_within:
+                    continue
+                if nodata is not None and value == nodata:
+                    nodata_count += 1
+                else:
+                    counts[int(value)] += 1
+                result["total"] += 1
+            result["nodata"] = nodata_count
+            return result
+    except (rasterio.errors.RasterioIOError, RuntimeError, ValueError) as exc:
+        print(f"error: could not read raster {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
 # GBIF species observations (second, independent data source)
 # --------------------------------------------------------------------------
 
@@ -566,7 +702,7 @@ def fetch_gbif_species(lat: float, lon: float, radius: int, top: int = 10,
 
 def print_report(lat: float, lon: float, radius: int, summary: dict,
                  with_wiki: bool = True, with_gbif: bool = True,
-                 source: str | None = None) -> None:
+                 source: str | None = None, corine: dict | None = None) -> None:
     """Print a plain-text report of the summarised data."""
     print(f"Location: {lat}, {lon}  (radius {radius} m)")
     if source:
@@ -666,6 +802,38 @@ def print_report(lat: float, lon: float, radius: int, summary: dict,
                       "this area)")
             print()
 
+    if corine is not None:
+        land = corine["total"] - corine["nodata"]
+        resx, resy = corine["resolution"]
+        cell = f"~{round((resx + resy) / 2)} m cells"
+        print("CORINE land cover (raster)")
+        print(f"  {land} land pixels sampled within the radius "
+              f"({corine['nodata']} nodata)  [{corine['crs']}, {cell}]")
+        if land > 0:
+            forest_items = sorted(
+                ((code, n) for code, n in corine["counts"].items()
+                 if code in CORINE_FOREST_CODES),
+                key=lambda kv: -kv[1])
+            if forest_items:
+                print("  Forest classes:")
+                for code, n in forest_items:
+                    print(f"    {corine_class_name(code)} ({code}): "
+                          f"{n} px ({100 * n / land:.0f}%)")
+                print(f"  Dominant forest class: {forest_estimate(corine['counts'])}")
+            else:
+                print("  (no CORINE forest classes within the radius)")
+            other = sorted((kv for kv in corine["counts"].items()
+                            if kv[0] not in CORINE_FOREST_CODES),
+                           key=lambda kv: -kv[1])[:5]
+            if other:
+                print("  Other classes (top 5):")
+                for code, n in other:
+                    print(f"    {corine_class_name(code)} ({code}): "
+                          f"{n} px ({100 * n / land:.0f}%)")
+        else:
+            print("  (the point lies outside the raster coverage)")
+        print()
+
     if (summary["forest_area_count"] == 0 and summary["tree_count"] == 0
             and summary["tree_row_count"] == 0):
         print("Nothing found at this location.")
@@ -701,6 +869,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--osm-pbf", metavar="FILE", default=None,
                         help="read a local OSM extract (.osm.pbf or .osm XML) "
                         "instead of querying the Overpass API")
+    parser.add_argument("--corine", metavar="FILE", default=None,
+                        help="sample a CORINE land cover GeoTIFF for an "
+                        "authoritative forest-type estimate")
     return parser.parse_args(argv)
 
 
@@ -745,7 +916,9 @@ def main(argv: list[str] | None = None) -> None:
         print_report(args.lat, args.lon, radius, summary,
                      with_wiki=not args.no_wiki,
                      with_gbif=not args.no_gbif,
-                     source=source)
+                     source=source,
+                     corine=sample_raster(args.corine, args.lat, args.lon, radius)
+                     if args.corine else None)
     finally:
         sys.stdout = old_stdout
 
