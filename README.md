@@ -1,32 +1,44 @@
 # Forrest Type Classification
 
-Based on a location (Lat/Long), describe what type of forrest there are in
-the surrounding area. What are the typical species of trees that can be found.
-What do they typical look like, what properties has the tree got and other
-kinds of information would be nice to read about.
+You give the program a location: a latitude and a longitude. The program
+describes the forest around that location. It lists the tree species that
+grow there. It also describes what the trees look like and what properties
+they have.
 
-We could make use of the Overpass API to obtain this information, see:
+The program reads data from these sources:
 
-https://wiki.openstreetmap.org/wiki/Overpass_API#Quick_Start_(60_seconds):_for_Developers/Programmers
+- OpenStreetMap (a free world map that anyone can edit), through the
+  Overpass API (a free search service for OpenStreetMap data):
+  https://wiki.openstreetmap.org/wiki/Overpass_API#Quick_Start_(60_seconds):_for_Developers/Programmers
+- Wikipedia, for short descriptions of each species
+- GBIF, a free database of species observations
+- CORINE Land Cover, a satellite-based land-cover map of Europe
 
-As a proof-of-concept we could perhaps implement a simple Python program to
-extract and study what information we can gather.
+`forrest_type.py` is a proof of concept (a small program that shows what
+the data can give). See the Usage section below.
 
-That proof-of-concept is `forrest_type.py` (see Usage below).
-
-A future extension could be to create a fun and informative Android first Flutter app.
+A possible future extension is a Flutter app for Android. This document
+does not cover that app.
 
 ## Usage
 
 ### Setup
 
-```sh
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+1. Create a Python environment (an isolated copy of Python for one
+   project):
+   ```sh
+   python -m venv .venv
+   ```
+2. Start using that environment:
+   ```sh
+   source .venv/bin/activate
+   ```
+3. Install the packages that `forrest_type.py` needs:
+   ```sh
+   pip install -r requirements.txt
+   ```
 
-`pytest` is used for the offline unit tests (`pip install pytest`).
+The offline unit tests use `pytest`. Install it with `pip install pytest`.
 
 ### Run
 
@@ -45,31 +57,34 @@ python forrest_type.py 0 0                            # ocean -> empty-result pa
 python forrest_type.py 59.3293 18.0686 --raw > dump.json
 ```
 
-The script queries the Overpass API for forest areas (`natural=wood`,
+The script asks the Overpass API for forest areas (`natural=wood`,
 `landuse=forest`), tree rows (`natural=tree_row`) and mapped trees
-(`natural=tree`) within the radius, then prints:
+(`natural=tree`). The radius is the distance around your point. The
+default radius is 1000 m. The script prints:
 
-- counts of forest areas and mapped trees,
-- a forest-type estimate built from `leaf_type` + `leaf_cycle`
-  (e.g. "Deciduous broadleaf forest"),
-- named forests, `wood=*` and `protect_class=*` tags,
-- the most common `species` / `genus` / `taxon` values (split on `;`),
-- short Wikipedia descriptions of the top species (from the
-  [Wikipedia REST API](https://en.wikipedia.org/api/rest_v1/)),
-  since OSM tags carry no appearance data,
-- species *actually observed* within the radius, from the
-  [GBIF occurrence API](https://www.gbif.org/developer/summary) — an
-  independent second source that works even where nobody has mapped
-  trees in OSM. All plants are listed (GBIF has no tree-only filter),
-  so herbs and mosses can appear alongside trees.
+- the number of forest areas and mapped trees
+- a forest-type estimate from the `leaf_type` and `leaf_cycle` tags, for
+  example "Deciduous broadleaf forest"
+- named forests and the `wood=*` and `protect_class=*` tags
+- the most common `species`, `genus` and `taxon` values. The script
+  splits values that contain `;` into separate names.
+- short Wikipedia descriptions of the top species. OSM tags carry no
+  appearance data. The script therefore reads the
+  [Wikipedia REST API](https://en.wikipedia.org/api/rest_v1/).
+- species that people observed within the radius. The
+  [GBIF occurrence API](https://www.gbif.org/developer/summary) is an
+  independent source. It also works where nobody mapped trees in OSM.
+  GBIF lists all plants. Herbs and mosses appear next to the trees.
 
-`--raw` dumps the raw Overpass JSON — this is the main purpose of the PoC:
-studying what data actually exists around a point.
+The flag `--raw` prints the raw Overpass JSON. Study that dump to learn
+what data exists around a point. That study is the main purpose of this
+proof of concept.
 
 ### Offline mode (`--osm-pbf`)
 
-Instead of querying the Overpass API, the same OSM data can be read from a
-local extract — deterministic, no 504s, repeatable:
+You can read the same OSM data from a local extract instead of the
+Overpass API. An extract is a snapshot file of the map data. The extract
+gives repeatable results and no HTTP 504 replies.
 
 ```sh
 mkdir -p data
@@ -79,62 +94,108 @@ python forrest_type.py 59.3293 18.0686 --radius 2000 \
     --osm-pbf data/sweden-latest.osm.pbf
 ```
 
-Extracts for any region are available from
-[Geofabrik](https://download.geofabrik.de/). This needs the `osmium`
-(pyosmium) package, which is in `requirements.txt`. `--raw` then dumps the
-collected elements as JSON instead. Notes:
+[Geofabrik](https://download.geofabrik.de/) publishes extracts for many
+regions. The extract mode needs the `osmium` (pyosmium) package. It is in
+`requirements.txt`. With `--osm-pbf`, the flag `--raw` prints the
+collected elements as JSON.
 
-- forests come from closed ways and multipolygon relations (assembled into
-  areas by pyosmium), tree rows from open ways, trees from nodes;
-- the `around:` semantics are approximated: an element is included when any
-  of its vertices is within the radius, or when the point falls inside a
-  forest polygon;
-- extracts can lag behind the live OSM database (typically hours to days).
+Notes:
+
+- pyosmium assembles forests from closed ways and multipolygon
+  relations. Tree rows come from open ways. Trees come from nodes.
+- The extract mode approximates the `around:` rule. An element counts
+  when any vertex lies within the radius, or when your point lies inside
+  a forest polygon.
+- An extract can lag behind the live OSM database by hours or days.
 
 ### CORINE land cover (`--corine`)
 
-For an *authoritative* forest-type estimate that never depends on OSM tag
-coverage, sample a CORINE Land Cover raster (100 m classes: 311 broad-leaved,
-312 coniferous, 313 mixed, 324 transitional woodland) around the point:
+OSM tags do not cover every forest. For a forest-type estimate that does
+not depend on OSM, the script can sample a CORINE Land Cover raster. A
+raster is a grid image where each cell holds a value. CORINE uses 100 m
+cells. The forest classes are 311 (broad-leaved), 312 (coniferous),
+313 (mixed) and 324 (transitional woodland).
 
 ```sh
 python forrest_type.py 59.3293 18.0686 --corine data/clc2018_europe.tif
 ```
 
-The CORINE raster is free but requires a (free) account on the Copernicus
-Land Monitoring Service: <https://land.copernicus.eu/pan-european/corine-land-cover/clc2018>.
-Place the GeoTIFF in `data/` (gitignored). Any class-coded GeoTIFF works;
-pixel centres are reprojected to WGS84 and measured with the haversine
-formula, so both the native EPSG:3035 rasters and Web Mercator exports are
-sampled correctly. Needs `rasterio` and `pyproj` (in `requirements.txt`).
+The CORINE raster is free. You must create a free account on the
+Copernicus Land Monitoring Service to download it:
+<https://land.copernicus.eu/pan-european/corine-land-cover/clc2018>.
+Put the GeoTIFF file in `data/`. That directory is not tracked by git.
+Any class-coded GeoTIFF works. The script measures the distance from
+your point to each pixel centre with the haversine formula (a standard
+way to measure distance on a sphere). It reads the native EPSG:3035
+rasters correctly, and it reads Web Mercator exports correctly too.
+This mode needs `rasterio` and `pyproj`. They are in
+`requirements.txt`.
 
-The report shows the class mix inside the radius and the dominant forest
-class — a useful cross-check against the OSM-tag estimate: the two sources
-are independent and usually agree for well-mapped areas.
+The report shows the class mix within the radius and the dominant forest
+class. OSM and CORINE are independent sources. They usually agree in
+areas that mappers mapped well. Use them to check each other.
 
 ## Data-source caveats and limitations
 
-- **OSM species tagging is sparse.** Many forest areas only carry
-  `leaf_type`/`leaf_cycle`, and plenty carry no forest tags at all. When no
-  species data is found the report says so and the forest type falls back to
-  "unspecified" rather than guessing.
-- **The public Overpass servers rate-limit (HTTP 429) and time out (HTTP 504)**
-  on large queries. The script retries with backoff and falls back to the
-  [kumi.systems mirror](https://overpass.kumi.systems/). The radius is capped
-  at 5000 m for this reason.
-- **`around` matches elements touching the radius**, so a point inside a large
-  forest usually matches; a point near but outside it may not. In
-  `--osm-pbf` mode the same approximation is implemented locally (any
-  vertex within the radius, or the point inside a forest polygon).
-- **Wikipedia titles may not match** the scientific names in OSM tags; failed
-  lookups are non-fatal and simply skipped.
-- **GBIF records are observations, not forest composition.** The counts
-  reflect where people recorded plants (iNaturalist, herbaria, field
-  surveys) and are biased toward well-surveyed, often urban areas. The
-  lookup is best-effort: a failed call prints a warning and the report
-  continues without the section.
-- The forest-type label is a rough estimate from the dominant tags, not a
-  proper classification of the vegetation. The `--corine` section is the
-  independent counterpart: it classifies actual land cover, but at 100 m
-  resolution and with its own generalisation errors (e.g. urban parks can
-  come out as forest, clear-cuts as transitional woodland).
+- OSM species tagging is sparse. Many forest areas carry only
+  `leaf_type` and `leaf_cycle`. Some carry no forest tags at all. When
+  the script finds no species data, it prints that fact. The forest type
+  then reads "unspecified". The script does not guess.
+- The public Overpass servers limit request rates (HTTP 429) and time
+  out (HTTP 504) on large queries. The script retries with backoff. If
+  the first server fails, it falls back to the
+  [kumi.systems mirror](https://overpass.kumi.systems/). For this
+  reason the radius cap is 5000 m.
+- The Overpass `around:` rule matches elements that touch the radius. A
+  point inside a large forest usually matches. A point close to the
+  forest edge does not always match. The `--osm-pbf` mode applies the
+  same rule locally. An element counts when any vertex lies within the
+  radius, or when your point lies inside a forest polygon.
+- Wikipedia titles do not always match the scientific names in OSM
+  tags. A failed lookup is not an error. The script skips it.
+- GBIF counts observations, not forest composition. People record plants
+  where they walk. The counts favour well-surveyed and often urban
+  areas. A failed GBIF request prints a warning. The report continues
+  without that section.
+- The OSM forest-type label is an estimate from the dominant tags. The
+  `--corine` section classifies actual land cover from satellite data.
+  CORINE works at 100 m resolution and has its own errors. For example,
+  an urban park can come out as forest. A clear-cut can come out as
+  transitional woodland.
+
+## Data licenses
+
+The sources have their own licenses. This section names each license and
+the credit line to use.
+
+OpenStreetMap data uses the Open Database License (ODbL). ODbL requires
+this credit line: "© OpenStreetMap contributors". ODbL also has a
+share-alike clause. If you build a derived database from OSM data, that
+database must use ODbL too. A report that reads OSM and prints findings
+is not a derived database. Geofabrik extracts carry the same ODbL terms
+as the live data.
+
+Wikipedia text uses the Creative Commons Attribution-ShareAlike license
+(CC BY-SA). A report that quotes a description credits Wikipedia. An app
+that redistributes the text must also share that text under CC BY-SA.
+
+GBIF brokers data from thousands of publishers. Each occurrence record
+carries the license of its dataset. Most records are CC0 or CC BY. Some
+are CC BY-NC (non-commercial use only). A commercial product must filter
+those records out or avoid redistributing them. GBIF asks for credit to
+the underlying datasets.
+
+CORINE Land Cover and other Copernicus data use the Copernicus license.
+The license is free and allows commercial use. It has no share-alike
+clause. It requires an attribution line, for example: "Land cover: ©
+Copernicus - CLC 2018".
+
+The current script only reads data and prints a report. It therefore
+needs only the credit lines above. The planned Flutter app will
+redistribute data. Check this section again before that work starts.
+
+## License
+
+This project uses the Mozilla Public License 2.0 (MPL-2.0). The LICENSE
+file in the repository root holds the full license text.
+
